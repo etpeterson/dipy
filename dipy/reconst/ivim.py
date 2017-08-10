@@ -9,6 +9,8 @@ import warnings
 from dipy.reconst.base import ReconstModel
 from dipy.reconst.multi_voxel import multi_voxel_fit
 import itertools as it
+import dipy.reconst.dti as dti
+from ..core.onetime import auto_attr
 
 SCIPY_LESS_0_17 = (LooseVersion(scipy.version.short_version) <
                    LooseVersion('0.17'))
@@ -198,10 +200,12 @@ class IvimModel(ReconstModel):
 
     def __init__(self, gtab, split_b_D=400.0, split_b_S0=200., bounds=None,
                  two_stage=True, fast_linear_fit=False, tol=1e-15,
-                 noneg_exp=2.0,
+                 noneg_exp=1.0,
                  x_scale=[1000., 0.1, 0.001, 0.0001],
                  options={'gtol': 1e-15, 'ftol': 1e-15,
-                          'eps': 1e-15, 'maxiter': 1000}):
+                          'eps': 1e-15, 'maxiter': 1000},
+                 linear_fit_diffusion_method='OLS', linear_fit_diffusion_args=(), linear_fit_diffusion_kwargs={},
+                 linear_fit_flow_method='OLS', linear_fit_flow_args=(), linear_fit_flow_kwargs={}):
         """
         Initialize an IVIM model.
 
@@ -304,6 +308,12 @@ class IvimModel(ReconstModel):
         self.noneg_exp = noneg_exp
         self.options = options
         self.x_scale = x_scale
+        self.linear_fit_diffusion_method = linear_fit_diffusion_method
+        self.linear_fit_diffusion_args = linear_fit_diffusion_args
+        self.linear_fit_diffusion_kwargs = linear_fit_diffusion_kwargs
+        self.linear_fit_flow_method = linear_fit_flow_method
+        self.linear_fit_flow_args = linear_fit_flow_args
+        self.linear_fit_flow_kwargs = linear_fit_flow_kwargs
 
         if SCIPY_LESS_0_17 and self.bounds is not None:
             e_s = "Scipy versions less than 0.17 do not support "
@@ -314,9 +324,40 @@ class IvimModel(ReconstModel):
         else:
             self.bounds = bounds
 
-    @multi_voxel_fit
     def fit(self, data, mask=None):
-        """ Fit method of the Ivim model class.
+        """ The fit function here is not @multi_voxel_fit wrapped to prevent
+        the linear fitting function from getting wrapped
+
+
+        Parameters
+        ----------
+        data : array
+            The measured signal from one voxel. A multi voxel decorator
+            will be applied to this fit method to scale it and apply it
+            to multiple voxels.
+
+        mask : array
+            A boolean array used to mark the coordinates in the data that
+            should be analyzed that has the shape data.shape[:-1]
+
+        Returns
+        -------
+        IvimFit object
+        """
+
+        if self.fast_linear_fit:
+            params_linear = self.fit_linear(data, mask)
+            if self.two_stage:
+                return self.mvfit(data, mask, params_linear)
+            else:
+                return IvimFit(self, params_linear)
+        else:
+            return self.mvfit(data, mask)
+
+
+    @multi_voxel_fit
+    def mvfit(self, data, mask=None, params_linear=None):
+        """ Multi-Voxel Fit method of the Ivim model class.
 
         The fitting takes place in the following steps: Linear fitting for D
         (bvals > `split_b_D` (default: 400)) and store S0_prime. Another linear
@@ -346,9 +387,8 @@ class IvimModel(ReconstModel):
         -------
         IvimFit object
         """
-        if self.fast_linear_fit:
-            params_linear = self.fit_linear(data, mask)
-        else:
+
+        if not self.fast_linear_fit:
             # Get S0_prime and D - paramters assuming a single exponential decay
             # for signals for bvals greater than `split_b_D`
             S0_prime, D = self.estimate_linear_fit(
@@ -417,12 +457,19 @@ class IvimModel(ReconstModel):
         low_bvals = self.gtab.bvals <= self.split_b_S0
 
         # step 1
-        S0_prime, D = self.estimate_linear_fit(data, b_selection=high_bvals)
-        params_high_b = np.array([S0_prime, 0, 0, D])
+        DTI_S0 = dti.TensorModel(self.gtab[high_bvals], fit_method=self.linear_fit_diffusion_method, return_S0_hat=True, *self.linear_fit_diffusion_args, **self.linear_fit_diffusion_kwargs)
+        DTIfit_S0 = DTI_S0.fit(data[..., high_bvals], mask)
+        S0_prime = DTIfit_S0.S0_hat
+        D = DTIfit_S0.model_params
+        #old, non-tensor method below
+        #S0_prime, D = self.estimate_linear_fit(data, b_selection=high_bvals)
+        #params_high_b = np.array([S0_prime, 0, 0, D])
 
         # step 2
-        resid = _ivim_error(params_high_b, self.gtab, data) ** self.noneg_exp  # params=[S0, f, D*, D]
-        low_and_positive = np.logical_and(resid > 0, low_bvals)
+        resid = np.power(DTIfit_S0.residuals(data, self.gtab, S0=S0_prime.squeeze()), self.noneg_exp)  # not sure why I need to send in S0 and squeeze it at the moment
+        #old, non-tensor method below
+        #resid = _ivim_error(params_high_b, self.gtab, data) ** self.noneg_exp  # params=[S0, f, D*, D]
+        #low_and_positive = np.logical_and(resid > 0, low_bvals)
 
         #I'm leaving shifted and pure and complex fitting in here for now in case I want to compare later
         #resid_shifted = _ivim_error(params_high_b, self.gtab, data) # params=[S0, f, D*, D]
@@ -433,9 +480,16 @@ class IvimModel(ReconstModel):
         #low_and_positive_pure = np.logical_and(resid_pure > 0, low_bvals)
 
         # step 3
-        S0_resid, D_star = self.estimate_linear_fit(resid, b_selection=low_and_positive)
-        S0_resid **= 1.0 / self.noneg_exp
+        DTI_S0 = dti.TensorModel(self.gtab[low_bvals], fit_method=self.linear_fit_flow_method, return_S0_hat=True, *self.linear_fit_flow_args, **self.linear_fit_flow_kwargs)
+        DTIfit_S0 = DTI_S0.fit(resid[..., low_bvals], mask)
+        S0_resid = DTIfit_S0.S0_hat
+        D_star = DTIfit_S0.model_params
+        S0_resid = np.power(S0_resid, 1.0 / self.noneg_exp)
         D_star /= self.noneg_exp
+        #old, non-tensor method below
+        #S0_resid, D_star = self.estimate_linear_fit(resid, b_selection=low_and_positive)
+        #S0_resid **= 1.0 / self.noneg_exp
+        #D_star /= self.noneg_exp
 
         #S0_resid_shifed, D_star_shifted = self.estimate_linear_fit(resid_shifted, b_selection=low_bvals)
 
@@ -448,9 +502,13 @@ class IvimModel(ReconstModel):
 
         # step 5
         f = S0_resid / S0
+        f[np.isnan(f)] = 0
 
         # return the values
-        params = np.array([S0, f, D_star, D])
+        #ndim = np.ndim(D) - 1
+        S0.shape += (1,) * (D.ndim - S0.ndim)
+        f.shape += (1,) * (D.ndim - S0.ndim)
+        params = np.concatenate((S0, f, D_star, D), axis=3)  # np.array([S0, f, D_star, D])
         return params
 
     def estimate_linear_fit(self, data, split_b=None, less_than=True, b_selection=None):
@@ -491,6 +549,7 @@ class IvimModel(ReconstModel):
             else:
                 warningMsg = "In estimate_linear_fit, either split_b or b_selection is required!"
                 warnings.warn(warningMsg, UserWarning)
+
 
         D, neg_log_S0 = np.polyfit(self.gtab.bvals[b_selection],
                                        -np.log(data[b_selection]), 1)
@@ -751,6 +810,227 @@ class IvimFit(object):
     @property
     def S0_prime(self):
         return self.model_params[..., 0] - self.S0_resid
+
+    @property
+    def evals_flow(self):
+        """
+        Returns the eigenvalues of the tensor as an array
+        """
+        return self.model_params[..., 2:5]
+
+    @property
+    def evals_diffusion(self):
+        """
+        Returns the eigenvalues of the tensor as an array
+        """
+        return self.model_params[..., 14:17]
+
+    @property
+    def evecs_flow(self):
+        """
+        Returns the eigenvectors of the tensor as an array, columnwise
+        """
+        evecs = self.model_params[..., 5:14]
+        return evecs.reshape(self.shape + (3, 3))
+
+    @property
+    def evecs_diffusion(self):
+        """
+        Returns the eigenvectors of the tensor as an array, columnwise
+        """
+        evecs = self.model_params[..., 17:26]
+        return evecs.reshape(self.shape + (3, 3))
+
+    @auto_attr
+    def md_flow(self):
+        r"""
+        Mean diffusitivity (MD) calculated from cached eigenvalues.
+
+        Returns
+        ---------
+        md : array (V, 1)
+            Calculated MD.
+
+        Notes
+        --------
+        MD is calculated with the following equation:
+
+        .. math::
+
+            MD = \frac{\lambda_1+\lambda_2+\lambda_3}{3}
+
+        """
+        return self.trace_flow / 3.0
+
+    @auto_attr
+    def md_diffusion(self):
+        r"""
+        Mean diffusitivity (MD) calculated from cached eigenvalues.
+
+        Returns
+        ---------
+        md : array (V, 1)
+            Calculated MD.
+
+        Notes
+        --------
+        MD is calculated with the following equation:
+
+        .. math::
+
+            MD = \frac{\lambda_1+\lambda_2+\lambda_3}{3}
+
+        """
+        return self.trace_diffusion / 3.0
+
+    @auto_attr
+    def fa_flow(self):
+        """Fractional anisotropy (FA) calculated from cached eigenvalues."""
+        return dti.fractional_anisotropy(self.evals_flow)
+
+    @auto_attr
+    def fa_diffusion(self):
+        """Fractional anisotropy (FA) calculated from cached eigenvalues."""
+        return dti.fractional_anisotropy(self.evals_diffusion)
+
+    @auto_attr
+    def color_fa_flow(self):
+        """Color fractional anisotropy of diffusion tensor"""
+        return dti.color_fa(self.fa_flow, self.evecs_flow)
+
+    @auto_attr
+    def color_fa_diffusion(self):
+        """Color fractional anisotropy of diffusion tensor"""
+        return dti.color_fa(self.fa_diffusion, self.evecs_diffusion)
+
+    @auto_attr
+    def rd_flow(self):
+        r"""
+        Radial diffusitivity (RD) calculated from cached eigenvalues.
+
+        Returns
+        ---------
+        rd : array (V, 1)
+            Calculated RD.
+
+        Notes
+        --------
+        RD is calculated with the following equation:
+
+        .. math::
+
+          RD = \frac{\lambda_2 + \lambda_3}{2}
+
+
+        """
+        return dti.radial_diffusivity(self.evals_flow)
+
+    @auto_attr
+    def rd_diffusion(self):
+        r"""
+        Radial diffusitivity (RD) calculated from cached eigenvalues.
+
+        Returns
+        ---------
+        rd : array (V, 1)
+            Calculated RD.
+
+        Notes
+        --------
+        RD is calculated with the following equation:
+
+        .. math::
+
+          RD = \frac{\lambda_2 + \lambda_3}{2}
+
+
+        """
+        return dti.radial_diffusivity(self.evals_diffusion)
+
+    @auto_attr
+    def ad_flow(self):
+        r"""
+        Axial diffusivity (AD) calculated from cached eigenvalues.
+
+        Returns
+        ---------
+        ad : array (V, 1)
+            Calculated AD.
+
+        Notes
+        --------
+        RD is calculated with the following equation:
+
+        .. math::
+
+          AD = \lambda_1
+
+
+        """
+        return dti.axial_diffusivity(self.evals_flow)
+
+    @auto_attr
+    def ad_diffusion(self):
+        r"""
+        Axial diffusivity (AD) calculated from cached eigenvalues.
+
+        Returns
+        ---------
+        ad : array (V, 1)
+            Calculated AD.
+
+        Notes
+        --------
+        RD is calculated with the following equation:
+
+        .. math::
+
+          AD = \lambda_1
+
+
+        """
+        return dti.axial_diffusivity(self.evals_diffusion)
+
+    @auto_attr
+    def trace_flow(self):
+        r"""
+        Trace of the tensor calculated from cached eigenvalues.
+
+        Returns
+        ---------
+        trace : array (V, 1)
+            Calculated trace.
+
+        Notes
+        --------
+        The trace is calculated with the following equation:
+
+        .. math::
+
+          trace = \lambda_1 + \lambda_2 + \lambda_3
+        """
+        return dti.trace(self.evals_flow)
+
+    @auto_attr
+    def trace_diffusion(self):
+        r"""
+        Trace of the tensor calculated from cached eigenvalues.
+
+        Returns
+        ---------
+        trace : array (V, 1)
+            Calculated trace.
+
+        Notes
+        --------
+        The trace is calculated with the following equation:
+
+        .. math::
+
+          trace = \lambda_1 + \lambda_2 + \lambda_3
+        """
+        return dti.trace(self.evals_diffusion)
+
 
     def predict(self, gtab, S0=1.):
         """Given a model fit, predict the signal.

@@ -848,6 +848,19 @@ class TensorFit(object):
         return type(self)(self.model, model_params[index], model_S0=model_S0)
 
     @property
+    def S0_evals_evecs(self):
+        if self.model_S0 is not None:
+            model_S0 = self.model_S0
+            model_S0.shape += (1,) * (self.model_params.ndim - self.model_S0.ndim)
+            #if np.ndim(self.model_S0) < np.ndim(self.model_params):
+            #    model_S0 = np.expand_dims(self.model_S0, np.ndim(self.model_params) - 1)
+            #else:
+            #    model_S0 = self.model_S0
+            return np.concatenate((model_S0, self.model_params), axis=3)
+        else:
+            return self.model_params
+
+    @property
     def S0_hat(self):
         return self.model_S0
 
@@ -1213,6 +1226,33 @@ class TensorFit(object):
             predict[i:i + step] = tensor_prediction(params[i:i + step], gtab,
                                                     S0=this_S0)
         return predict.reshape(shape + (gtab.bvals.shape[0], ))
+
+    def residuals(self, data, gtab, S0=None, step=None):
+        r"""
+        Given a model fit, find the residual signal on the vertices of a sphere
+
+        Parameters
+        ----------
+        gtab : a GradientTable class instance
+            This encodes the directions for which a prediction is made
+
+        S0 : float array
+           The mean non-diffusion weighted signal in each voxel. Default:
+           The fitted S0 value in all voxels if it was fitted. Otherwise 1 in
+           all voxels.
+
+        step : int
+            The chunk size as a number of voxels. Optional parameter with
+            default value 10,000.
+
+            In order to increase speed of processing, tensor fitting is done
+            simultaneously over many voxels. This parameter sets the number of
+            voxels that will be fit at once in each iteration. A larger step
+            value should speed things up, but it will also take up more memory.
+            It is advisable to keep an eye on memory consumption as this value
+            is increased.
+        """
+        return data - self.predict(gtab, S0, step)
 
 
 def iter_fit_tensor(step=1e4):

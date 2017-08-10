@@ -70,6 +70,17 @@ class GradientTable(object):
         self.small_delta = small_delta
         self.b0_threshold = b0_threshold
 
+    def __getitem__(self, index):
+        GT = type(self)(self.gradients[index, ...], big_delta=self.big_delta,
+                             small_delta=self.small_delta, b0_threshold=self.b0_threshold)
+        try:
+            GT.bvals = self.bvals[index]
+            GT.bvecs = self.bvecs[index, ...]
+            GT.b0s_mask = self.b0s_mask[index]
+        except NameError:
+            pass
+        return GT
+
     @auto_attr
     def bvals(self):
         return vector_norm(self.gradients)
